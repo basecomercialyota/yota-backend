@@ -103,7 +103,6 @@ router.patch('/users/:id/senha', auth, adminOnly, async (req, res) => {
     const user = await User.findById(req.params.id);
     if (!user) return res.status(404).json({ erro: 'Usuário não encontrado.' });
 
-    // Assign new password — the pre-save hook will hash it automatically
     user.senha = senha;
     user.ativo = true;
     await user.save();
