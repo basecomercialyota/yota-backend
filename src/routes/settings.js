@@ -4,7 +4,7 @@ const Setting = require('../models/Setting');
 const { auth, adminOnly } = require('../middleware/auth');
 
 // Chaves permitidas
-const ALLOWED_KEYS = ['system_wa', 'email_whitelist', 'kits_overrides'];
+const ALLOWED_KEYS = ['system_wa', 'email_whitelist', 'kits_overrides', 'bitrix_webhook_url', 'bitrix_users'];
 
 // GET /api/settings/:key — qualquer usuário autenticado pode ler
 router.get('/:key', auth, async (req, res) => {
@@ -20,10 +20,12 @@ router.get('/:key', auth, async (req, res) => {
     if (!setting) {
       // Retorna valor padrão se ainda não existe no banco
       const defaults = {
-        system_wa: '',
-        email_whitelist: [],
-        kits_overrides: {}
-      };
+  system_wa: '',
+  email_whitelist: [],
+  kits_overrides: {},
+  bitrix_webhook_url: '',
+  bitrix_users: {}
+};
       return res.json({ key, value: defaults[key] });
     }
 
@@ -89,12 +91,13 @@ router.get('/', auth, async (req, res) => {
   try {
     const settings = await Setting.find({ key: { $in: ALLOWED_KEYS } });
 
-    const defaults = {
-      system_wa: '',
-      email_whitelist: [],
-      kits_overrides: {}
-    };
-
+   const defaults = {
+  system_wa: '',
+  email_whitelist: [],
+  kits_overrides: {},
+  bitrix_webhook_url: '',
+  bitrix_users: {}
+};
     // Monta objeto com todas as chaves, usando default para as ausentes
     const result = {};
     ALLOWED_KEYS.forEach(k => {
