@@ -8,7 +8,7 @@ const proposalRoutes = require('./routes/proposals');
 const contractRoutes = require('./routes/contracts');
 const settingsRoutes = require('./routes/settings');
 const visitasRoutes  = require('./routes/visitas');
-
+const funilRoutes   = require('../bitrix-funil');
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
@@ -34,6 +34,7 @@ app.use('/api/proposals', proposalRoutes);
 app.use('/api/contracts', contractRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/visitas', visitasRoutes);
+app.use('/funil', funilRoutes);
 
 // ── Health check ─────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({
