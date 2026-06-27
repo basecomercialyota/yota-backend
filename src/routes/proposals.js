@@ -6,6 +6,58 @@ const { auth, adminOnly } = require('../middleware/auth');
 
 const router = express.Router();
 
+// ── Bitrix24: helpers (anti-duplicidade) ──────────────────────
+function bitrixPost(base, method, payload) {
+  return new Promise((resolve) => {
+    try {
+      const url    = base.replace(/\/$/, '') + '/' + method + '.json';
+      const body   = JSON.stringify(payload);
+      const urlObj = new URL(url);
+      const options = {
+        hostname: urlObj.hostname,
+        path:     urlObj.pathname + urlObj.search,
+        method:   'POST',
+        headers:  {
+          'Content-Type':   'application/json',
+          'Content-Length': Buffer.byteLength(body),
+        },
+      };
+      const reqB = https.request(options, (resp) => {
+        let data = '';
+        resp.on('data', chunk => data += chunk);
+        resp.on('end', () => { try { resolve(JSON.parse(data)); } catch(e) { resolve(null); } });
+      });
+      reqB.on('error', () => resolve(null));
+      reqB.setTimeout(5000, () => { reqB.destroy(); resolve(null); });
+      reqB.write(body);
+      reqB.end();
+    } catch(e) { resolve(null); }
+  });
+}
+
+// Procura um card JÁ EXISTENTE no funil COMERCIAL (CATEGORY_ID 12) por telefone.
+async function buscarDealComercialPorTelefone(webhookUrl, telefoneLimpo) {
+  if (!telefoneLimpo) return null;
+  const resp = await bitrixPost(webhookUrl, 'crm.duplicate.findbycomm', {
+    type: 'PHONE', entity_type: 'DEAL', values: [telefoneLimpo],
+  });
+  const ids = (resp && resp.result && Array.isArray(resp.result.DEAL)) ? resp.result.DEAL : [];
+  for (const id of ids) {
+    const d = await bitrixPost(webhookUrl, 'crm.deal.get', { id });
+    if (d && d.result && String(d.result.CATEGORY_ID) === '12') {
+      return d.result.ID;
+    }
+  }
+  return null;
+}
+
+// Posta um comentário na timeline de um card existente.
+async function postarComentarioTimeline(webhookUrl, dealId, texto, authorId) {
+  const fields = { ENTITY_ID: dealId, ENTITY_TYPE: 'deal', COMMENT: texto };
+  if (authorId) fields.AUTHOR_ID = authorId;
+  await bitrixPost(webhookUrl, 'crm.timeline.comment.add', { fields });
+}
+
 // ── Bitrix24: criar negócio ──────────────────────────────────
 async function criarNegocioBitrix(prop, vendedor) {
   try {
@@ -24,6 +76,22 @@ async function criarNegocioBitrix(prop, vendedor) {
     // Mapear e-mail do vendedor para ID Bitrix
     const usersMap  = usersSetting ? usersSetting.value : {};
     const bitrixId  = usersMap[vendedor.email] || null;
+
+    // ── ANTI-DUPLICIDADE: já existe card no funil COMERCIAL com este telefone? ──
+    const telefoneLimpo = (prop.telefone || '').replace(/\D/g, '');
+    const dealExistente = await buscarDealComercialPorTelefone(webhookUrl, telefoneLimpo);
+    if (dealExistente) {
+      const quando = new Date().toLocaleString('pt-BR', { timeZone: 'America/Fortaleza' });
+      const comentarioDup =
+        `Novo contato via Base Comercial (PROPOSTA) — ${vendedor.nome}` +
+        (prop.cidade ? ` | Cidade: ${prop.cidade}` : '') +
+        (prop.quantidade_placas ? ` | Placas: ${prop.quantidade_placas}` : '') +
+        (prop.observacao ? ` | Obs: ${prop.observacao}` : '') +
+        ` | ${quando}`;
+      await postarComentarioTimeline(webhookUrl, dealExistente, comentarioDup, bitrixId);
+      console.log(`[Bitrix] Cliente já tinha card (ID=${dealExistente}) — comentário adicionado, sem duplicar.`);
+      return;
+    }
 
     // Montar comentários com dados técnicos
     const comentario = [
