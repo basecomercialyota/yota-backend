@@ -4,7 +4,7 @@ const Setting = require('../models/Setting');
 const { auth, adminOnly } = require('../middleware/auth');
 
 // Chaves permitidas
-const ALLOWED_KEYS = ['system_wa', 'email_whitelist', 'kits_overrides', 'bitrix_webhook_url', 'bitrix_users'];
+const ALLOWED_KEYS = ['system_wa', 'email_whitelist', 'kits_overrides', 'bitrix_webhook_url', 'bitrix_users', 'batalha_config'];
 
 // GET /api/settings/:key — qualquer usuário autenticado pode ler
 router.get('/:key', auth, async (req, res) => {
@@ -24,7 +24,8 @@ router.get('/:key', auth, async (req, res) => {
   email_whitelist: [],
   kits_overrides: {},
   bitrix_webhook_url: '',
-  bitrix_users: {}
+  bitrix_users: {},
+  batalha_config: { ativo: false, mostrarAnimacoes: false, equipes: [] }
 };
       return res.json({ key, value: defaults[key] });
     }
@@ -72,6 +73,12 @@ router.put('/:key', auth, adminOnly, async (req, res) => {
     }
   }
 
+  if (key === 'batalha_config') {
+    if (typeof value !== 'object' || Array.isArray(value)) {
+      return res.status(400).json({ erro: 'batalha_config deve ser um objeto' });
+    }
+  }
+
   try {
     const setting = await Setting.findOneAndUpdate(
       { key },
@@ -96,7 +103,8 @@ router.get('/', auth, async (req, res) => {
   email_whitelist: [],
   kits_overrides: {},
   bitrix_webhook_url: '',
-  bitrix_users: {}
+  bitrix_users: {},
+  batalha_config: { ativo: false, mostrarAnimacoes: false, equipes: [] }
 };
     // Monta objeto com todas as chaves, usando default para as ausentes
     const result = {};
