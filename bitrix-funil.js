@@ -1,7 +1,11 @@
 /**
  * ╔══════════════════════════════════════════════════════════════╗
- * ║  YOTA — Dashboard Funil Comercial Online v2                 ║
- * ║  bitrix-funil.js — Railway (yota-backend)                   ║
+ * ║  YOTA — Funil Comercial Online  ·  bitrix-funil.js  v3       ║
+ * ║  Railway (yota-backend)                                      ║
+ * ║                                                              ║
+ * ║  Conta pelo HISTÓRICO de etapas (quem PASSOU pela etapa),    ║
+ * ║  não pela etapa atual do card. Regras validadas contra o     ║
+ * ║  Bitrix real em 22/07/2026.                                  ║
  * ╚══════════════════════════════════════════════════════════════╝
  */
 
@@ -9,283 +13,395 @@ const express = require('express');
 const router  = express.Router();
 
 // ════════════════════════════════════════════════════════════
-// CONFIGURAÇÃO — edite aqui para adicionar/remover usuários
+// CONFIGURAÇÃO
 // ════════════════════════════════════════════════════════════
-const CONFIG = {
-  PIPELINE_ID: 22,  // "COM. ONLINE NV."
+const PIPELINE_ID = 22;                 // COM. ONLINE NV.
+const TZ          = 'America/Fortaleza'; // Natal/RN (UTC-3, sem horário de verão)
+const TTL_MS      = 5 * 60 * 1000;       // cache de 5 minutos
+const MAX_DIAS    = 400;                 // trava de segurança da janela
 
-  ESTAGIO_VENDA      : 'C22:WON',          // NEGÓCIOS FECHADOS — única fonte de verdade para venda
-  ESTAGIO_NEGOCIACAO : 'C22:UC_SG6G3W',   // NEGOCIAÇÃO
-  ESTAGIO_PROPOSTA   : 'C22:PREPAYMENT_INVOIC', // PROPOSTA
-
-  // Etapas que indicam que o SDR converteu o lead (gerou reunião para o Closer)
-  ESTAGIOS_REUNIAO: [
-    'C22:UC_SG6G3W',        // Negociação
-    'C22:PREPAYMENT_INVOIC',// Proposta
-    'C22:UC_TQLGDY',        // Pend. Aprovação
-    'C22:UC_MWUK8W',        // Fechamento
-    'C22:UC_LESBGS',        // Stand-by
-    'C22:UC_96B9D5',        // Finalização
-    'C22:WON',              // Negócios Fechados
-  ],
-
-  // Etapa ignorada (REPASSE)
-  ESTAGIO_IGNORADO: 'C22:UC_54VG0E',   // REPASSE
-  ESTAGIOS_IGNORADOS: ['C22:UC_54VG0E', 'C22:APOLOGY'],  // REPASSE + Analisar falha
-
-  // ── CLOSERS — adicione IDs aqui para incluir novos closers ──
-  CLOSER_IDS: [94, 50],  // 94=Allef Gabriel, 50=João Pedro Alves
-
-  // ── SDRs — deixe vazio [] para tratar todos os não-closers como SDR ──
-  SDR_IDS: [68],  // 68=Lauro Medeiros
+// Mapa REAL das etapas — extraído de crm.dealcategory.stage.list?id=22
+// g = grupo: 1 SDR · 2 Closer · 3 Encerrado
+const STAGES = {
+  'C22:NEW'               : { n: 'LEAD',                  g: 1, s: 10  },
+  'C22:UC_5BPBXG'         : { n: 'MQL',                   g: 1, s: 20  },
+  'C22:UC_7T8VE5'         : { n: 'FOLLOW-UP 1',           g: 1, s: 30  },
+  'C22:1'                 : { n: 'FOLLOW-UP 2',           g: 1, s: 40  },
+  'C22:2'                 : { n: 'FOLLOW-UP 3',           g: 1, s: 50  },
+  'C22:UC_AL2ADW'         : { n: 'NUTRIÇÃO',              g: 1, s: 60  },
+  'C22:PREPARATION'       : { n: 'MUDO',                  g: 1, s: 70  },
+  'C22:PREPAYMENT_INVOIC' : { n: 'PROPOSTA',              g: 1, s: 80  },
+  'C22:UC_TQLGDY'         : { n: 'PENDENTE DE APROVAÇÃO', g: 1, s: 90  },
+  'C22:UC_CJK6DW'         : { n: 'APROVADO RECUPERADO',   g: 1, s: 100 },
+  'C22:UC_SG6G3W'         : { n: 'REUNIÃO',               g: 2, s: 110 },
+  'C22:UC_HJ91TL'         : { n: 'NO SHOW',               g: 2, s: 120 },
+  'C22:UC_HMX25R'         : { n: 'CALL 1',                g: 2, s: 130 },
+  'C22:UC_RITC68'         : { n: 'CALL 2',                g: 2, s: 140 },
+  'C22:UC_4TL73R'         : { n: 'CALL 3',                g: 2, s: 150 },
+  'C22:UC_WI7TZ0'         : { n: 'NEGOCIAÇÃO',            g: 2, s: 160 },
+  'C22:UC_IIC7V2'         : { n: 'ESFRIOU',               g: 2, s: 170 },
+  'C22:UC_LESBGS'         : { n: 'STAND-BY (NUTRIÇÃO 2)', g: 2, s: 180 },
+  'C22:UC_MWUK8W'         : { n: 'FECHAMENTO',            g: 2, s: 190 },
+  'C22:UC_96B9D5'         : { n: 'FINALIZAÇÃO',           g: 2, s: 200 },
+  'C22:WON'               : { n: 'NEGÓCIOS FECHADOS',     g: 3, s: 210 },
+  'C22:LOSE'              : { n: 'CRÉDITO REPROVADO',     g: 3, s: 220 },
+  'C22:APOLOGY'           : { n: 'ANALISAR FALHA',        g: 3, s: 230 },
+  'C22:UC_J0L7TE'         : { n: 'FECHADO C/ OUTRA EMP.', g: 3, s: 240 },
 };
 
-const ESTAGIO_LABELS = {
-  'C22:NEW'               : 'Lead',
-  'C22:UC_5BPBXG'        : 'MQL',
-  'C22:UC_7T8VE5'        : 'Follow-up 1',
-  'C22:1'                : 'Follow-up 2',
-  'C22:2'                : 'Follow-up 3',
-  'C22:UC_AL2ADW'        : 'Nutrição',
-  'C22:PREPARATION'      : 'Mudo',
-  'C22:PREPAYMENT_INVOIC': 'Proposta',
-  'C22:UC_TQLGDY'        : 'Pend. Aprovação',
-  'C22:UC_SG6G3W'        : 'Negociação',
-  'C22:UC_HJ91TL'        : 'Sem Retorno',
-  'C22:UC_HMX25R'        : 'Call 1',
-  'C22:UC_RITC68'        : 'Call 2',
-  'C22:UC_4TL73R'        : 'Call 3',
-  'C22:UC_IIC7V2'        : 'Esfriou',
-  'C22:UC_MWUK8W'        : 'Fechamento',
-  'C22:UC_LESBGS'        : 'Stand-by',
-  'C22:UC_96B9D5'        : 'Finalização ✅',
-  'C22:WON'              : 'Negócios Fechados',
-  'C22:LOSE'             : 'Crédito Reprovado',
-  'C22:UC_J0L7TE'        : 'Fechado Outra Emp.',
-};
+const NUTRICAO = 'C22:UC_AL2ADW';
+const VENDA    = 'C22:WON';
+const FALHA    = 'C22:APOLOGY';                       // depósito de lead morto
+const PROPOSTA = ['C22:PREPAYMENT_INVOIC', 'C22:UC_TQLGDY', 'C22:UC_CJK6DW'];
+const ENC_REAL = ['C22:LOSE', 'C22:UC_J0L7TE'];       // conversou: pediu crédito ou foi p/ concorrente
+
+// Marcador do documento de handoff que a IA grava no campo COMMENTS
+const IA_MARCADORES = ['HADNOFF', 'HANDOFF', 'ATENDIMENTO SDR'];
 
 // ════════════════════════════════════════════════════════════
-// BITRIX API
+// DATAS — tudo no fuso de Natal
+// ════════════════════════════════════════════════════════════
+const _fmtDia = new Intl.DateTimeFormat('en-CA', {
+  timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit',
+});
+const diaNatal = iso => _fmtDia.format(new Date(iso));      // -> 'YYYY-MM-DD'
+
+function somaDias(ymd, n) {
+  const d = new Date(ymd + 'T12:00:00Z');
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+function difDias(ymdA, ymdB) {
+  return Math.round((new Date(ymdB + 'T12:00:00Z') - new Date(ymdA + 'T12:00:00Z')) / 86400000);
+}
+
+// ════════════════════════════════════════════════════════════
+// BITRIX
 // ════════════════════════════════════════════════════════════
 function getWebhook() {
   const url = process.env.BITRIX_WEBHOOK_URL;
-  if (!url) throw new Error('BITRIX_WEBHOOK_URL não configurado');
+  if (!url) throw new Error('BITRIX_WEBHOOK_URL não configurado nas variáveis do Railway');
   return url.endsWith('/') ? url : url + '/';
 }
 
-async function bxCall(method, params = {}) {
-  const qs = new URLSearchParams();
-  function flatten(obj, prefix = '') {
-    for (const [k, v] of Object.entries(obj)) {
-      const key = prefix ? `${prefix}[${k}]` : k;
-      if (v !== null && typeof v === 'object' && !Array.isArray(v)) {
-        flatten(v, key);
-      } else if (Array.isArray(v)) {
-        v.forEach((item, i) => qs.append(`${key}[${i}]`, item));
-      } else if (v !== undefined && v !== null) {
-        qs.append(key, v);
-      }
-    }
+function flatten(obj, prefix, out) {
+  for (const [k, v] of Object.entries(obj)) {
+    const key = prefix ? `${prefix}[${k}]` : k;
+    if (Array.isArray(v))                          v.forEach((it, i) => flatten({ [i]: it }, key, out));
+    else if (v !== null && typeof v === 'object')  flatten(v, key, out);
+    else if (v !== undefined && v !== null)        out.append(key, v);
   }
-  flatten(params);
+}
 
-  const res  = await fetch(`${getWebhook()}${method}.json?${qs.toString()}`);
+async function bxCall(method, params = {}) {
+  const body = new URLSearchParams();
+  flatten(params, '', body);
+  const res = await fetch(`${getWebhook()}${method}.json`, {
+    method : 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body,
+  });
   if (!res.ok) throw new Error(`Bitrix HTTP ${res.status}`);
   const data = await res.json();
   if (data.error) throw new Error(`Bitrix: ${data.error_description || data.error}`);
-  return data.result;
+  return data;
 }
 
-// ════════════════════════════════════════════════════════════
-// BUSCA DEALS — apenas pipeline 22, sem REPASSE
-// ════════════════════════════════════════════════════════════
-async function getDeals(dataInicio, dataFim) {
-  const deals = [];
-  let start = 0;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-  const filter = { 'CATEGORY_ID': CONFIG.PIPELINE_ID };
-  if (dataInicio) filter['>=DATE_CREATE'] = dataInicio;
-  if (dataFim)    filter['<=DATE_CREATE'] = dataFim;
+// ── Coorte: negócios CRIADOS na janela ──────────────────────
+async function getDeals(iniYMD, fimYMD) {
+  // pede com 1 dia de folga dos dois lados (fuso) e corta fino depois
+  const filter = {
+    CATEGORY_ID     : PIPELINE_ID,
+    '>=DATE_CREATE' : somaDias(iniYMD, -1) + 'T00:00:00',
+    '<=DATE_CREATE' : somaDias(fimYMD,  1) + 'T23:59:59',
+  };
+  const select = ['ID', 'TITLE', 'STAGE_ID', 'ASSIGNED_BY_ID',
+                  'DATE_CREATE', 'OPPORTUNITY', 'COMMENTS'];
 
-  const select = ['ID','TITLE','STAGE_ID','ASSIGNED_BY_ID',
-                  'DATE_CREATE','DATE_MODIFY','OPPORTUNITY','CATEGORY_ID'];
-
+  const todos = [];
+  let start = 0, guarda = 0;
   while (true) {
-    const res = await bxCall('crm.deal.list', { filter, select, start });
-    if (!res || !res.length) break;
-    deals.push(...res);
-    if (res.length < 50) break;
-    start += 50;
+    const r = await bxCall('crm.deal.list', { filter, select, order: { DATE_CREATE: 'ASC' }, start });
+    todos.push(...(r.result || []));
+    if (r.next === undefined || r.next === null) break;
+    start = r.next;
+    if (++guarda > 200) break;
+    await sleep(260);
+  }
+  // corte exato pelo dia de Natal
+  return todos.filter(d => {
+    const dia = diaNatal(d.DATE_CREATE);
+    return dia >= iniYMD && dia <= fimYMD;
+  });
+}
+
+// ── Histórico de etapas, em pacotes de 50 ───────────────────
+async function getHistorico(ids, onProgress) {
+  const out = {};
+  let usarBatch = true;
+  let feitos = 0;
+
+  if (usarBatch) {
+    for (let i = 0; i < ids.length; i += 50) {
+      const lote = ids.slice(i, i + 50);
+      const cmd  = {};
+      lote.forEach((id, k) => {
+        cmd['c' + k] = `crm.stagehistory.list?entityTypeId=2&filter[OWNER_ID]=${id}`;
+      });
+      try {
+        const r   = await bxCall('batch', { halt: 0, cmd });
+        const res = (r.result && r.result.result) || {};
+        let ok = 0;
+        lote.forEach((id, k) => {
+          const bloco = res['c' + k];
+          if (bloco && bloco.items) { out[id] = bloco.items; ok++; }
+          else                      { out[id] = out[id] || []; }
+        });
+        feitos += lote.length;
+        if (onProgress) onProgress(feitos, ids.length);
+        if (ok === 0) { usarBatch = false; break; }
+      } catch (e) {
+        usarBatch = false;
+        break;
+      }
+      await sleep(350);
+    }
+    if (usarBatch) return out;
   }
 
-  // Remove etapa REPASSE
-  return deals.filter(d => !CONFIG.ESTAGIOS_IGNORADOS.includes(d.STAGE_ID));
+  // plano B: um a um
+  for (const id of ids) {
+    try {
+      const r = await bxCall('crm.stagehistory.list', { entityTypeId: 2, filter: { OWNER_ID: id } });
+      out[id] = (r.result && r.result.items) || [];
+    } catch { out[id] = []; }
+    if (onProgress) onProgress(++feitos, ids.length);
+    await sleep(210);
+  }
+  return out;
 }
 
 async function getUsuarios() {
   try {
-    const res = await bxCall('user.get', { filter: { ACTIVE: true } });
+    const r   = await bxCall('user.get', {});
     const map = {};
-    for (const u of (res || [])) map[String(u.ID)] = `${u.NAME} ${u.LAST_NAME}`.trim();
+    for (const u of (r.result || [])) {
+      map[String(u.ID)] = `${u.NAME || ''} ${u.LAST_NAME || ''}`.trim() || ('Usuário ' + u.ID);
+    }
     return map;
-  } catch { return {}; }
+  } catch { return {}; }   // webhook sem permissão de usuários — segue com IDs
 }
 
 // ════════════════════════════════════════════════════════════
-// MÉTRICAS
+// REGRAS DO FUNIL  (validadas em 22/07/2026)
+//
+//  Retorno         = o cliente respondeu de verdade.
+//                    Follow-up NÃO conta (é o SDR perseguindo cliente calado)
+//                    e lead mudo arquivado em "Analisar falha" também não.
+//  Desenvolvimento = respondeu E avançou (Proposta em diante, ou Closer,
+//                    ou encerrou com resultado real).
+//  Reunião         = passou por qualquer etapa do Closer (grupo 2).
+//  Venda           = chegou em NEGÓCIOS FECHADOS.
 // ════════════════════════════════════════════════════════════
-function calcular(deals, usuarios) {
-  // Enriquece
-  for (const d of deals) {
-    d._nome     = usuarios[String(d.ASSIGNED_BY_ID)] || `User ${d.ASSIGNED_BY_ID}`;
-    d._isCloser = CONFIG.CLOSER_IDS.includes(Number(d.ASSIGNED_BY_ID));
-    d._isSDR    = CONFIG.SDR_IDS.length > 0
-      ? CONFIG.SDR_IDS.includes(Number(d.ASSIGNED_BY_ID))
-      : !d._isCloser;
-  }
+function classificar(set) {
+  let g2 = false;
+  for (const s of set) { const m = STAGES[s]; if (m && m.g === 2) g2 = true; }
+  if (set.has(VENDA))                         return 'venda';
+  if (g2)                                     return 'closer';
+  if (PROPOSTA.some(s => set.has(s)))         return 'proposta';
+  if (ENC_REAL.some(s => set.has(s)))         return 'encreal';
+  if (set.has(NUTRICAO))                      return 'nutricao';
+  if (set.has(FALHA))                         return 'arquivado';
+  return 'sem';
+}
+const RET_SIM = ['nutricao', 'encreal', 'proposta', 'closer', 'venda'];
+const DES_SIM = ['encreal', 'proposta', 'closer', 'venda'];
 
-  const sdrDeals    = deals.filter(d => d._isSDR);
-  const closerDeals = deals.filter(d => d._isCloser);
+function temIA(comments) {
+  if (!comments) return false;
+  const u = String(comments).toUpperCase();
+  return IA_MARCADORES.some(m => u.includes(m));
+}
 
-  // ── SDR ──
-  const totalLeads  = sdrDeals.length;
-  const reunioes    = sdrDeals.filter(d => CONFIG.ESTAGIOS_REUNIAO.includes(d.STAGE_ID)).length;
-  const txConversao = totalLeads > 0 ? (reunioes / totalLeads * 100).toFixed(1) : '0.0';
+// ════════════════════════════════════════════════════════════
+// MONTAGEM
+// ════════════════════════════════════════════════════════════
+function montar(deals, hist, usuarios, iniYMD, fimYMD) {
+  const linhas = deals.map(d => {
+    const itens = hist[d.ID] || [];
+    const set   = new Set(itens.map(i => i.STAGE_ID));
+    set.add(d.STAGE_ID);                       // segurança: etapa atual sempre conta
 
-  const sdMap = {};
-  for (const d of sdrDeals) {
-    const id = String(d.ASSIGNED_BY_ID);
-    if (!sdMap[id]) sdMap[id] = { nome: d._nome, leads: 0, reunioes: 0 };
-    sdMap[id].leads++;
-    if (CONFIG.ESTAGIOS_REUNIAO.includes(d.STAGE_ID)) sdMap[id].reunioes++;
-  }
-  const rankingSDR = Object.entries(sdMap).map(([id, v]) => ({
-    vendedorId: id, vendedor: v.nome, leads: v.leads, reunioes: v.reunioes,
-    conversao: v.leads > 0 ? (v.reunioes / v.leads * 100).toFixed(1) : '0.0',
-    alertaBaixo: v.leads > 0 && v.reunioes / v.leads < 0.25,
-  })).sort((a, b) => b.reunioes - a.reunioes);
+    let tocouG2 = false;
+    for (const s of set) { const m = STAGES[s]; if (m && m.g === 2) tocouG2 = true; }
 
-  const porDia = {};
-  for (const d of sdrDeals) {
-    const key = new Date(d.DATE_CREATE).toISOString().slice(0,10);
-    porDia[key] = (porDia[key] || 0) + 1;
-  }
+    const cls   = classificar(set);
+    const atual = STAGES[d.STAGE_ID] || null;
+    const dia   = diaNatal(d.DATE_CREATE);
 
-  // ── CLOSER ──
-  const reunioesCloser = closerDeals.filter(d => CONFIG.ESTAGIOS_REUNIAO.includes(d.STAGE_ID)).length;
-  const propostas = closerDeals.filter(d => [
-    CONFIG.ESTAGIO_PROPOSTA, 'C22:UC_TQLGDY', CONFIG.ESTAGIO_NEGOCIACAO,
-    CONFIG.ESTAGIO_VENDA, 'C22:WON',
-  ].includes(d.STAGE_ID)).length;
+    const venceu = itens.find(i => i.STAGE_ID === VENDA);
+    const diasAteVenda = venceu
+      ? Math.max(0, difDias(dia, diaNatal(venceu.CREATED_TIME)))
+      : null;
 
-  // VENDA = exclusivamente FINALIZAÇÃO
-  const vendaDeals = closerDeals.filter(d => d.STAGE_ID === CONFIG.ESTAGIO_VENDA);
-  const nVendas    = vendaDeals.length;
-  const receita    = vendaDeals.reduce((s, d) => s + (parseFloat(d.OPPORTUNITY) || 0), 0);
-  const ticket     = nVendas > 0 ? receita / nVendas : 0;
-
-  const clMap = {};
-  for (const d of closerDeals) {
-    const id = String(d.ASSIGNED_BY_ID);
-    if (!clMap[id]) clMap[id] = { nome: d._nome, vendas: 0, receita: 0, propostas: 0 };
-    if ([CONFIG.ESTAGIO_PROPOSTA, 'C22:UC_TQLGDY'].includes(d.STAGE_ID)) clMap[id].propostas++;
-    if (d.STAGE_ID === CONFIG.ESTAGIO_VENDA) {
-      clMap[id].vendas++;
-      clMap[id].receita += parseFloat(d.OPPORTUNITY) || 0;
-    }
-  }
-  const rankingCloser = Object.entries(clMap).map(([id, v]) => ({
-    vendedorId: id, vendedor: v.nome, vendas: v.vendas,
-    receita: v.receita, propostas: v.propostas,
-    ticket: v.vendas > 0 ? v.receita / v.vendas : 0,
-  })).sort((a, b) => b.receita - a.receita);
-
-  // ── Pipeline ──
-  const stageCount = {};
-  for (const d of deals) {
-    if (!stageCount[d.STAGE_ID]) stageCount[d.STAGE_ID] = { quantidade: 0, valor: 0 };
-    stageCount[d.STAGE_ID].quantidade++;
-    stageCount[d.STAGE_ID].valor += parseFloat(d.OPPORTUNITY) || 0;
-  }
-  const pipeline = {};
-  for (const [stageId, dados] of Object.entries(stageCount)) {
-    pipeline[stageId] = {
-      label     : ESTAGIO_LABELS[stageId] || stageId,
-      quantidade: dados.quantidade,
-      valor     : dados.valor,
+    return {
+      id       : d.ID,
+      titulo   : d.TITLE || '',
+      dia,                                     // YYYY-MM-DD no fuso de Natal
+      etapa    : atual ? atual.n : d.STAGE_ID,
+      grupo    : atual ? atual.g : 1,
+      cls,
+      ret      : RET_SIM.includes(cls),
+      des      : DES_SIM.includes(cls),
+      reu      : tocouG2,
+      ven      : cls === 'venda',
+      ia       : temIA(d.COMMENTS),
+      valor    : parseFloat(d.OPPORTUNITY) || 0,
+      // Só vale quando o card NUNCA foi para o Closer: aí o responsável
+      // ainda é o SDR original. Serve para conferência, nunca para agrupar.
+      sdrReal  : tocouG2 ? null : String(d.ASSIGNED_BY_ID),
+      semRastro: itens.length === 0,
     };
+  });
+
+  const n     = linhas.length;
+  const conta = f => linhas.filter(f).length;
+  const ret   = conta(r => r.ret);
+  const des   = conta(r => r.des);
+  const reu   = conta(r => r.reu);
+  const ven   = conta(r => r.ven);
+  const taxa  = (a, b) => (b > 0 ? Math.round((a / b) * 1000) / 10 : 0);
+
+  // distribuição do diagnóstico
+  const diag = {};
+  for (const r of linhas) diag[r.cls] = (diag[r.cls] || 0) + 1;
+
+  // ciclo até a venda
+  const ciclos = linhas.filter(r => r.ven).map(r => {
+    const v = (hist[r.id] || []).find(i => i.STAGE_ID === VENDA);
+    return v ? Math.max(0, difDias(r.dia, diaNatal(v.CREATED_TIME))) : null;
+  }).filter(x => x !== null).sort((a, b) => a - b);
+  const ciclo = ciclos.length ? {
+    mediana : ciclos[Math.floor(ciclos.length / 2)],
+    min     : ciclos[0],
+    max     : ciclos[ciclos.length - 1],
+    amostra : ciclos.length,
+    confiavel: ciclos.length >= 5,
+  } : null;
+
+  // IA vs sem IA
+  const comIA = linhas.filter(r => r.ia);
+  const semIA = linhas.filter(r => !r.ia);
+
+  // quem o Bitrix registrou (só cards que nunca foram ao Closer)
+  const registrados = {};
+  for (const r of linhas) {
+    if (!r.sdrReal) continue;
+    const k = r.sdrReal;
+    registrados[k] = registrados[k] || { id: k, nome: usuarios[k] || ('Usuário ' + k), cards: 0, de: r.dia, ate: r.dia };
+    registrados[k].cards++;
+    if (r.dia < registrados[k].de)  registrados[k].de  = r.dia;
+    if (r.dia > registrados[k].ate) registrados[k].ate = r.dia;
   }
 
-  // ── Alertas ──
-  const agora   = Date.now();
-  const alertas = [];
-  for (const d of deals) {
-    const dias  = Math.floor((agora - new Date(d.DATE_MODIFY).getTime()) / 86400000);
-    const label = ESTAGIO_LABELS[d.STAGE_ID] || d.STAGE_ID;
-    if (d.STAGE_ID === 'C22:NEW'                  && dias >= 1) alertas.push({ tipo: 'sem_contato',         dealId: d.ID, titulo: d.TITLE, vendedor: d._nome, estagio: label, diasParado: dias });
-    if (d.STAGE_ID === CONFIG.ESTAGIO_NEGOCIACAO  && dias >= 5) alertas.push({ tipo: 'negociacao_parada',   dealId: d.ID, titulo: d.TITLE, vendedor: d._nome, estagio: label, diasParado: dias });
-    if (d.STAGE_ID === CONFIG.ESTAGIO_PROPOSTA    && dias >= 3) alertas.push({ tipo: 'proposta_sem_retorno',dealId: d.ID, titulo: d.TITLE, vendedor: d._nome, estagio: label, diasParado: dias });
-  }
-  alertas.sort((a, b) => b.diasParado - a.diasParado);
+  // maturação: o ciclo observado vai até ~34 dias
+  const hoje  = diaNatal(new Date().toISOString());
+  const idade = difDias(fimYMD, hoje);
 
   return {
-    sdr    : { totalLeads, reunioes, taxaConversao: txConversao, rankingSDR, porDia },
-    closer : { reunioes: reunioesCloser, propostas, vendas: nVendas, receita, ticketMedio: ticket,
-               txReuProp: reunioesCloser > 0 ? (propostas/reunioesCloser*100).toFixed(1) : '0.0',
-               txPropVend: propostas > 0 ? (nVendas/propostas*100).toFixed(1) : '0.0',
-               txReuVend: reunioesCloser > 0 ? (nVendas/reunioesCloser*100).toFixed(1) : '0.0',
-               rankingCloser },
-    pipeline,
-    alertas,
+    periodo: { dataInicio: iniYMD, dataFim: fimYMD, diasDesdeFechamento: idade, emMaturacao: idade < 30 },
+    funil: {
+      leads: n, retorno: ret, desenvolvimento: des, reuniao: reu, vendas: ven,
+      pctRetorno: taxa(ret, n), pctDesenvolvimento: taxa(des, n),
+      pctReuniao: taxa(reu, n), pctVendas: taxa(ven, n),
+    },
+    taxas: {
+      sdrLeadReuniao   : taxa(reu, n),     // conversão do SDR
+      sdrRespondeuReuniao: taxa(reu, ret), // tira o efeito da qualidade do lead
+      closerReuniaoVenda : taxa(ven, reu), // conversão do Closer
+    },
+    diagnostico: {
+      sem: diag.sem || 0, arquivado: diag.arquivado || 0, nutricao: diag.nutricao || 0,
+      encreal: diag.encreal || 0, proposta: diag.proposta || 0,
+      closer: diag.closer || 0, venda: diag.venda || 0,
+    },
+    ciclo,
+    receita: linhas.filter(r => r.ven).reduce((s, r) => s + r.valor, 0),
+    ia: {
+      total: comIA.length, pct: taxa(comIA.length, n),
+      reuniaoComIA: taxa(comIA.filter(r => r.reu).length, comIA.length),
+      reuniaoSemIA: taxa(semIA.filter(r => r.reu).length, semIA.length),
+      amostraOk: comIA.length >= 20 && semIA.length >= 20,
+    },
+    responsaveisRegistrados: Object.values(registrados).sort((a, b) => b.cards - a.cards),
+    semRastro: conta(r => r.semRastro),
+    // linhas cruas: o front agrupa por período de SDR e monta a tabela de conferência
+    linhas,
   };
 }
 
 // ════════════════════════════════════════════════════════════
 // CACHE
 // ════════════════════════════════════════════════════════════
-const _cache  = new Map();
-const TTL     = 5 * 60 * 1000;
+const _cache = new Map();
 
-async function getDados(dataInicio, dataFim, force) {
-  const key = `${dataInicio||'*'}_${dataFim||'*'}`;
-  const now  = Date.now();
-  if (!force && _cache.has(key) && now - _cache.get(key).ts < TTL) return _cache.get(key).data;
+async function getDados(iniYMD, fimYMD, force) {
+  const chave = `${iniYMD}_${fimYMD}`;
+  const agora = Date.now();
+  if (!force && _cache.has(chave) && agora - _cache.get(chave).ts < TTL_MS) {
+    return { ..._cache.get(chave).data, doCache: true };
+  }
 
-  const [deals, usuarios] = await Promise.all([getDeals(dataInicio, dataFim), getUsuarios()]);
-  const metricas = calcular(deals, usuarios);
-  const result   = { ok: true, geradoEm: new Date().toISOString(),
-                     pipeline_id: CONFIG.PIPELINE_ID, totalDeals: deals.length,
-                     periodo: { dataInicio: dataInicio||null, dataFim: dataFim||null },
-                     ...metricas };
-  _cache.set(key, { ts: now, data: result });
-  return result;
-}
+  const usuariosP = getUsuarios();
+  const deals     = await getDeals(iniYMD, fimYMD);
+  const hist      = deals.length ? await getHistorico(deals.map(d => d.ID)) : {};
+  const usuarios  = await usuariosP;
 
-function periodoParaDatas(p) {
-  const fim   = new Date(); fim.setHours(23,59,59,999);
-  const fimS  = fim.toISOString();
-  if (p === 'hoje') { const i = new Date(); i.setHours(0,0,0,0); return { dataInicio: i.toISOString(), dataFim: fimS }; }
-  if (p === '7d')   { const i = new Date(Date.now()-7*86400000);  i.setHours(0,0,0,0); return { dataInicio: i.toISOString(), dataFim: fimS }; }
-  if (p === '30d')  { const i = new Date(Date.now()-30*86400000); i.setHours(0,0,0,0); return { dataInicio: i.toISOString(), dataFim: fimS }; }
-  return { dataInicio: null, dataFim: null };
+  const dados = {
+    ok: true,
+    geradoEm: new Date().toISOString(),
+    pipeline: PIPELINE_ID,
+    totalDeals: deals.length,
+    ...montar(deals, hist, usuarios, iniYMD, fimYMD),
+    doCache: false,
+  };
+  _cache.set(chave, { ts: agora, data: dados });
+  return dados;
 }
 
 // ════════════════════════════════════════════════════════════
 // ENDPOINTS
 // ════════════════════════════════════════════════════════════
 
-// GET /funil/dados?periodo=hoje|7d|30d|all&refresh=1
-// GET /funil/dados?dataInicio=ISO&dataFim=ISO
+// GET /dados?dataInicio=2026-07-01&dataFim=2026-07-22[&refresh=1]
+// GET /dados?periodo=hoje|7d|30d|mes
 router.get('/dados', async (req, res) => {
   try {
-    let dataInicio, dataFim;
-    if (req.query.dataInicio && req.query.dataFim) {
-      dataInicio = req.query.dataInicio;
-      dataFim    = req.query.dataFim;
-    } else {
-      ({ dataInicio, dataFim } = periodoParaDatas(req.query.periodo || '30d'));
+    let ini = req.query.dataInicio;
+    let fim = req.query.dataFim;
+
+    if (!ini || !fim) {
+      const hoje = diaNatal(new Date().toISOString());
+      const p = req.query.periodo || 'mes';
+      if      (p === 'hoje') { ini = hoje;              fim = hoje; }
+      else if (p === '7d')   { ini = somaDias(hoje, -7);  fim = hoje; }
+      else if (p === '30d')  { ini = somaDias(hoje, -30); fim = hoje; }
+      else                   { ini = hoje.slice(0, 8) + '01'; fim = hoje; }  // mês atual
     }
-    const dados = await getDados(dataInicio, dataFim, req.query.refresh === '1');
+
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(ini) || !/^\d{4}-\d{2}-\d{2}$/.test(fim)) {
+      return res.status(400).json({ ok: false, erro: 'Datas devem estar no formato AAAA-MM-DD.' });
+    }
+    if (ini > fim) {
+      return res.status(400).json({ ok: false, erro: 'A data inicial está depois da final.' });
+    }
+    if (difDias(ini, fim) > MAX_DIAS) {
+      return res.status(400).json({ ok: false, erro: `Janela muito longa (máximo ${MAX_DIAS} dias).` });
+    }
+
+    const dados = await getDados(ini, fim, req.query.refresh === '1');
     res.json(dados);
   } catch (err) {
     console.error('[funil/dados]', err.message);
@@ -293,11 +409,21 @@ router.get('/dados', async (req, res) => {
   }
 });
 
-// GET /funil/config — mostra configuração atual
-router.get('/config', (req, res) => {
-  res.json({ ok: true, pipeline_id: CONFIG.PIPELINE_ID,
-             closer_ids: CONFIG.CLOSER_IDS, sdr_ids: CONFIG.SDR_IDS,
-             estagio_venda: CONFIG.ESTAGIO_VENDA });
+// GET /config — conferência rápida de que o módulo subiu certo
+router.get('/config', (_req, res) => {
+  res.json({
+    ok: true, versao: 3, pipeline: PIPELINE_ID, fuso: TZ,
+    etapasMapeadas: Object.keys(STAGES).length,
+    webhookConfigurado: !!process.env.BITRIX_WEBHOOK_URL,
+    cacheMinutos: TTL_MS / 60000,
+    regras: {
+      retorno        : 'passou por Nutrição, Proposta, Pendente, Aprovado, Closer, Crédito Reprovado ou Fechado c/ Outra Emp.',
+      naoContaRetorno: 'só follow-up, ou mudo arquivado em Analisar falha',
+      desenvolvimento: 'Proposta em diante, Closer, ou encerrado com resultado real',
+      reuniao        : 'passou por qualquer etapa do Closer (grupo 2)',
+      venda          : 'chegou em NEGÓCIOS FECHADOS',
+    },
+  });
 });
 
 module.exports = router;
